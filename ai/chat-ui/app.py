@@ -1,622 +1,42 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.templating import Jinja2Templates
 import httpx
 from time import perf_counter
 import uvicorn
 import json
-import subprocess
 import asyncio
 from pathlib import Path
 
 app = FastAPI()
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 VLLM_URL = "http://127.0.0.1:11435"
 VLLM_BASE_URL = VLLM_URL.rsplit(":", 1)[0]
 
-# Path to the ollama monitor script
-OLLAMA_MONITOR_SCRIPT = Path(__file__).parent.parent.parent / "monitoring" / "ollama_monitor.py"
+# Hardcoded Ollama instance config.
+# Each entry maps a GPU to a port. Edit this to add/remove instances.
+OLLAMA_INSTANCES = [
+    {
+        "pid":       None,
+        "port":      11434,
+        "gpu":       "RTX 3090 (24 GiB)",
+        "gpu_index": 0,
+        "gpu_uuid":  "GPU-c26d2adb-e44d-e390-cbf0-73f6eb8ea866",
+    },
+]
 
 
 def get_ollama_instances():
-    """
-    Get list of running Ollama instances with GPU information.
-    Returns a list of dicts with port, pid, and GPU name.
-    """
-    if not OLLAMA_MONITOR_SCRIPT.exists():
-        return []
-    
-    try:
-        result = subprocess.run(
-            ["python3", str(OLLAMA_MONITOR_SCRIPT)],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        
-        if result.returncode != 0:
-            return []
-        
-        # Monitor now returns a flat array: [{pid, port, gpu: {...}}]
-        entries = json.loads(result.stdout)
-        instances = []
-        for entry in entries:
-            gpu = entry.get("gpu") or {}
-            short_name = (
-                gpu.get("name", "Unknown GPU")
-                .replace("NVIDIA GeForce ", "")
-                .replace("NVIDIA ", "")
-            )
-            vram = gpu.get("memory", {}).get("total", "")
-            label = f"{short_name} ({vram})" if vram else short_name
-            instances.append({
-                "pid":  entry.get("pid"),
-                "port": entry["port"],
-                "gpu":  label,
-                "gpu_index": gpu.get("index"),
-            })
-        return instances
-    
-    except Exception as e:
-        print(f"Error running ollama monitor: {e}")
-        return []
+    return OLLAMA_INSTANCES
 
-
-HTML = r"""
-<html lang="fr">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Hipo Chat</title>
-  <style>
-    body {
-      margin: 0;
-      font-family: Arial, sans-serif;
-      background: #0b1020;
-      color: #e8ecf1;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
-    }
-    .app {
-      width: min(900px, 95vw);
-      height: min(85vh, 900px);
-      background: #121933;
-      border-radius: 16px;
-      display: flex;
-      flex-direction: column;
-      box-shadow: 0 10px 40px rgba(0,0,0,.35);
-      overflow: hidden;
-    }
-    .app.app-multi {
-      width: min(1280px, 98vw);
-    }
-    .app.app-many {
-      width: min(1500px, 99vw);
-    }
-    @media (max-width: 1024px) {
-      .app,
-      .app.app-multi,
-      .app.app-many {
-        width: 95vw;
-      }
-    }
-    .header {
-      padding: 18px 22px;
-      border-bottom: 1px solid rgba(255,255,255,.08);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-    }
-    .title {
-      font-size: 20px;
-      font-weight: 700;
-    }
-    .target {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 13px;
-      color: #c2d0e4;
-      flex-wrap: wrap;
-    }
-    .targets-list {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .target-item {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      border-radius: 10px;
-      border: 1px solid rgba(255,255,255,.15);
-      background: #0f1530;
-      color: white;
-      padding: 6px 10px;
-      font-size: 12px;
-      user-select: none;
-    }
-    .target-item input {
-      margin: 0;
-      accent-color: #22c55e;
-    }
-    .target-empty {
-      border-radius: 10px;
-      border: 1px solid rgba(255,255,255,.15);
-      background: #0f1530;
-      color: #9fb0c8;
-      padding: 6px 10px;
-      font-size: 12px;
-    }
-    .messages {
-      flex: 1;
-      overflow-y: auto;
-      padding: 18px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .msg {
-      max-width: 80%;
-      padding: 12px 14px;
-      border-radius: 14px;
-      line-height: 1.45;
-      white-space: pre-wrap;
-    }
-    .user {
-      align-self: flex-end;
-      background: #3b82f6;
-      color: white;
-    }
-    .assistant {
-      align-self: flex-start;
-      background: #1d274d;
-      color: #e8ecf1;
-    }
-    .composer {
-      display: flex;
-      gap: 10px;
-      padding: 16px;
-      border-top: 1px solid rgba(255,255,255,.08);
-    }
-    textarea {
-      flex: 1;
-      resize: none;
-      min-height: 56px;
-      max-height: 180px;
-      border-radius: 12px;
-      border: 1px solid rgba(255,255,255,.12);
-      background: #0f1530;
-      color: white;
-      padding: 14px;
-      font: inherit;
-      outline: none;
-    }
-    button {
-      border: 0;
-      border-radius: 12px;
-      padding: 0 18px;
-      background: #22c55e;
-      color: #08110c;
-      font-weight: 700;
-      cursor: pointer;
-    }
-    button:disabled {
-      opacity: .6;
-      cursor: not-allowed;
-    }
-    .hint {
-      padding: 0 18px 12px;
-      font-size: 12px;
-      color: #9fb0c8;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-    }
-    .hint-model {
-      font-size: 11px;
-      color: #7f93b2;
-    }
-    .msg-meta {
-      font-size: 10px;
-      color: #4a5a7a;
-      margin-top: 5px;
-      text-align: left;
-      padding-left: 2px;
-      align-self: flex-start;
-    }
-    .compare-row {
-      width: 100%;
-      display: grid;
-      gap: 10px;
-      align-items: stretch;
-    }
-    .compare-card {
-      background: #1d274d;
-      color: #e8ecf1;
-      border-radius: 14px;
-      padding: 10px 12px;
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .compare-head {
-      font-size: 11px;
-      color: #a7b8d3;
-      border-bottom: 1px solid rgba(255,255,255,.08);
-      padding-bottom: 6px;
-    }
-    .compare-body {
-      font-size: 14px;
-      line-height: 1.45;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .compare-meta {
-      font-size: 10px;
-      color: #4a5a7a;
-    }
-    .typing-indicator {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      margin-left: 6px;
-      vertical-align: middle;
-    }
-    .typing-dot {
-      width: 4px;
-      height: 4px;
-      border-radius: 50%;
-      background: #7f93b2;
-      opacity: 0.35;
-      animation: blink 1.1s infinite ease-in-out;
-    }
-    .typing-dot:nth-child(2) {
-      animation-delay: 0.2s;
-    }
-    .typing-dot:nth-child(3) {
-      animation-delay: 0.4s;
-    }
-    @keyframes blink {
-      0%, 80%, 100% { opacity: 0.35; transform: translateY(0); }
-      40% { opacity: 1; transform: translateY(-1px); }
-    }
-  </style>
-</head>
-<body>
-  <div class="app">
-    <div class="header">
-      <div class="title">Hipo</div>
-      <div class="target">
-        <span>Cibles:</span>
-        <div id="target-list" class="targets-list">
-          <span class="target-empty">Chargement...</span>
-        </div>
-      </div>
-    </div>
-    <div id="messages" class="messages">
-      <div class="msg assistant">Bonjour. Posez votre question.</div>
-    </div>
-    <div class="composer">
-      <textarea id="input" placeholder="Écrivez votre message..."></textarea>
-      <button id="send">Envoyer</button>
-    </div>
-      <div class="hint">
-        <span>Prototype de partage branché sur Ollama local.</span>
-      <span id="request-time" class="hint-model">Temps: -</span>
-    </div>
-  </div>
-
-  <script>
-    const MODEL_NAME = "qwen2.5:3b";
-    const messagesEl = document.getElementById("messages");
-    const inputEl = document.getElementById("input");
-    const sendBtn = document.getElementById("send");
-    const targetListEl = document.getElementById("target-list");
-    const requestTimeEl = document.getElementById("request-time");
-    const appEl = document.querySelector(".app");
-
-    const systemMessage = { role: "system", content: "You are a helpful assistant. Be concise." };
-    const historiesByPort = {};
-    let availableInstances = [];
-
-    // Load available Ollama instances
-    async function loadOllamaInstances() {
-      try {
-        const res = await fetch("/api/ollama-instances");
-        const data = await res.json();
-        
-        targetListEl.innerHTML = "";
-        availableInstances = data.instances || [];
-        
-        if (availableInstances.length > 0) {
-          availableInstances.forEach((instance, index) => {
-            const label = document.createElement("label");
-            label.className = "target-item";
-
-            const checkbox = document.createElement("input");
-            checkbox.type = "checkbox";
-            checkbox.dataset.index = String(index);
-            checkbox.checked = index === 0;
-
-            const text = document.createElement("span");
-            text.textContent = `Port ${instance.port} (${instance.gpu})`;
-
-            label.appendChild(checkbox);
-            label.appendChild(text);
-            targetListEl.appendChild(label);
-          });
-          updateAppWidth();
-        } else {
-          const empty = document.createElement("span");
-          empty.className = "target-empty";
-          empty.textContent = "Aucune instance Ollama trouvée";
-          targetListEl.appendChild(empty);
-          updateAppWidth();
-        }
-      } catch (err) {
-        console.error("Error loading Ollama instances:", err);
-        targetListEl.innerHTML = '<span class="target-empty">Erreur de chargement</span>';
-        updateAppWidth();
-      }
-    }
-
-    function getSelectedInstances() {
-      const checked = Array.from(
-        targetListEl.querySelectorAll('input[type="checkbox"]:checked')
-      );
-      return checked
-        .map((el) => availableInstances[Number(el.dataset.index)])
-        .filter(Boolean);
-    }
-
-    function updateAppWidth() {
-      const selectedCount = getSelectedInstances().length;
-      appEl.classList.toggle("app-multi", selectedCount > 1);
-      appEl.classList.toggle("app-many", selectedCount > 2);
-    }
-
-    // Load instances when page loads
-    loadOllamaInstances();
-
-    function addMessage(role, text) {
-      const div = document.createElement("div");
-      div.className = "msg " + (role === "user" ? "user" : "assistant");
-      div.textContent = text;
-      messagesEl.appendChild(div);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-    }
-
-    function createComparisonRow(instances) {
-      const cols = Math.max(1, instances.length);
-      const row = document.createElement("div");
-      row.className = "compare-row";
-      row.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
-
-      const cards = new Map();
-      instances.forEach((instance) => {
-        const gpuLabel = (instance.gpu || "").replace(/\s*\([^)]*MiB\)\s*$/, "");
-        const title = gpuLabel ? `Port ${instance.port} · ${gpuLabel}` : `Port ${instance.port}`;
-
-        const card = document.createElement("div");
-        card.className = "compare-card";
-
-        const head = document.createElement("div");
-        head.className = "compare-head";
-        head.textContent = title;
-
-        const body = document.createElement("div");
-        body.className = "compare-body";
-        body.textContent = "";
-
-        const meta = document.createElement("div");
-        meta.className = "compare-meta";
-        meta.textContent = "Generation en cours";
-
-        const typing = document.createElement("span");
-        typing.className = "typing-indicator";
-        for (let i = 0; i < 3; i += 1) {
-          const dot = document.createElement("span");
-          dot.className = "typing-dot";
-          typing.appendChild(dot);
-        }
-        meta.appendChild(typing);
-
-        card.appendChild(head);
-        card.appendChild(body);
-        card.appendChild(meta);
-        row.appendChild(card);
-
-        cards.set(instance.port, { body, meta, gpuLabel, typing });
-      });
-
-      messagesEl.appendChild(row);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-      return cards;
-    }
-
-    async function streamOneInstance(instance, text, cardRef) {
-      const portKey = String(instance.port);
-      if (!historiesByPort[portKey]) {
-        historiesByPort[portKey] = [systemMessage];
-      }
-      const portHistory = historiesByPort[portKey];
-      portHistory.push({ role: "user", content: text });
-
-      const res = await fetch("/v1/chat/completions/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: MODEL_NAME,
-          messages: portHistory,
-          temperature: 0.3,
-          vllm_port: instance.port,
-          gpu_index: instance.gpu_index,
-        }),
-      });
-
-      if (!res.ok || !res.body) {
-        throw new Error(`Streaming failed for port ${instance.port}`);
-      }
-
-      const decoder = new TextDecoder();
-      const reader = res.body.getReader();
-      let buffer = "";
-      let reply = "";
-      let usedModel = MODEL_NAME;
-      let elapsedMs = null;
-      let tpsStr = null;
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split("\n\n");
-        buffer = events.pop() || "";
-
-        for (const eventBlock of events) {
-          const lines = eventBlock.split("\n").filter(Boolean);
-          let eventName = "message";
-
-          for (const line of lines) {
-            if (line.startsWith("event:")) {
-              eventName = line.slice(6).trim();
-            }
-            if (!line.startsWith("data:")) {
-              continue;
-            }
-
-            const dataStr = line.slice(5).trim();
-            if (dataStr === "[DONE]") {
-              continue;
-            }
-
-            if (eventName === "metrics") {
-              try {
-                const metrics = JSON.parse(dataStr);
-                elapsedMs = Number(metrics.elapsed_ms);
-                const tps = Number(metrics.tokens_per_sec);
-                if (Number.isFinite(tps)) {
-                  tpsStr = `${tps.toFixed(1)} tok/s`;
-                }
-              } catch (e) {
-                // ignore malformed metrics events
-              }
-              continue;
-            }
-
-            try {
-              const chunk = JSON.parse(dataStr);
-              if (chunk?.model) {
-                usedModel = chunk.model;
-              }
-              const delta = chunk?.choices?.[0]?.delta?.content || "";
-              if (delta) {
-                reply += delta;
-                cardRef.body.textContent = reply;
-                messagesEl.scrollTop = messagesEl.scrollHeight;
-              }
-            } catch (e) {
-              // ignore malformed data lines
-            }
-          }
-        }
-      }
-
-      const elapsedStr = Number.isFinite(elapsedMs)
-        ? `${(elapsedMs / 1000).toFixed(2)} s`
-        : null;
-      const meta = [usedModel, cardRef.gpuLabel, tpsStr, elapsedStr]
-        .filter(Boolean)
-        .join(" · ");
-      cardRef.meta.textContent = meta || "Termine";
-      cardRef.typing = null;
-
-      if (!reply.trim()) {
-        reply = "Erreur: réponse vide";
-        cardRef.body.textContent = reply;
-      }
-      portHistory.push({ role: "assistant", content: reply });
-
-      return { elapsedMs };
-    }
-
-    async function sendMessage() {
-      const text = inputEl.value.trim();
-      if (!text) return;
-
-      const selectedInstances = getSelectedInstances();
-      if (!selectedInstances.length) {
-        addMessage("assistant", "Selectionnez au moins une cible.");
-        return;
-      }
-
-      addMessage("user", text);
-      inputEl.value = "";
-      sendBtn.disabled = true;
-      requestTimeEl.textContent = "Temps: en cours...";
-      const startAt = performance.now();
-
-      try {
-        const cards = createComparisonRow(selectedInstances);
-
-        const tasks = selectedInstances.map(async (instance) => {
-          const cardRef = cards.get(instance.port);
-          try {
-            return await streamOneInstance(instance, text, cardRef);
-          } catch (err) {
-            cardRef.body.textContent = "Erreur de connexion au serveur.";
-            cardRef.meta.textContent = cardRef.gpuLabel || "Erreur";
-            cardRef.typing = null;
-            return { elapsedMs: null };
-          }
-        });
-
-        const results = await Promise.all(tasks);
-
-        const validElapsed = results
-          .map((r) => r.elapsedMs)
-          .filter((v) => Number.isFinite(v));
-        if (validElapsed.length) {
-          requestTimeEl.textContent = `Temps: ${(Math.max(...validElapsed) / 1000).toFixed(2)} s`;
-        } else {
-          const total = (performance.now() - startAt) / 1000;
-          requestTimeEl.textContent = `Temps: ${total.toFixed(2)} s`;
-        }
-      } catch (err) {
-        requestTimeEl.textContent = "Temps: indisponible";
-        addMessage("assistant", "Erreur de connexion au serveur.");
-      } finally {
-        sendBtn.disabled = false;
-        inputEl.focus();
-      }
-    }
-
-    sendBtn.addEventListener("click", sendMessage);
-    inputEl.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage();
-      }
-    });
-    targetListEl.addEventListener("change", (e) => {
-      if (e.target && e.target.matches('input[type="checkbox"]')) {
-        updateAppWidth();
-      }
-    });
-  </script>
-</body>
-</html>
-"""
-
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTML
+@app.get("/")
+async def index(request: Request):
+  return templates.TemplateResponse(
+    request=request,
+    name="index.html",
+    context={"model_name": "qwen2.5:3b"},
+  )
 
 @app.get("/api/ollama-instances")
 async def get_instances():
@@ -624,8 +44,13 @@ async def get_instances():
     instances = get_ollama_instances()
     return JSONResponse(content={"instances": instances})
 
-@app.post("/v1/chat/completions")
+@app.post("/v2/chat/completions")
 async def chat_completions(request: Request):
+    return JSONResponse('ok')
+@app.post("/v1/chat/completions")
+
+async def chat_completions(request: Request):
+    
     payload = await request.json()
     selected_port = payload.pop("vllm_port", None)
     gpu_index = payload.pop("gpu_index", None)
@@ -651,13 +76,13 @@ async def chat_completions(request: Request):
         # Use first available port as fallback
         selected_port = instances[0]['port']
     
-    print(f"[CHAT] Using port: {selected_port}")
+    print(f"[CHAT] Using port: {selected_port}!!")
 
     target_url = f"{VLLM_BASE_URL}:{selected_port}"
 
     start_time = perf_counter()
     async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(f"{target_url}/v1/chat/completions", json=payload)
+        resp = await client.post(f"{target_url}/v2/chat/completions", json=payload)
     elapsed_ms = (perf_counter() - start_time) * 1000
 
     response_json = resp.json()

@@ -1,0 +1,69 @@
+# OS Files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# User-specific files
+.bash_history
+.bash_logout
+.zsh_history
+.lesshst
+.wget-hsts
+.sudo_as_admin_successful
+.profile
+.bashrc
+.zshrc
+
+# Sensitive/credential directories
+.cloudflared/
+.ssh/
+.aws/
+.config/
+.local/
+.cache/
+.copilot/
+.dotnet/
+.ollama/
+.triton/
+
+# Git
+.gitconfig
+
+# IDEs & Editors
+.vscode/
+.vscode-server/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.iml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
